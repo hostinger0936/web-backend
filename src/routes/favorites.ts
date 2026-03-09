@@ -1,6 +1,7 @@
 import express, { Request, Response } from "express";
 import Device from "../models/Device";
 import logger from "../logger/logger";
+import wsService from "../services/wsService";
 
 const router = express.Router();
 
@@ -33,11 +34,23 @@ router.put("/:deviceId", async (req: Request, res: Response) => {
   const { favorite } = req.body;
 
   try {
-    await Device.findOneAndUpdate(
+    const doc = await Device.findOneAndUpdate(
       { deviceId },
       { $set: { favorite: favorite === true } },
-      { upsert: true }
-    );
+      { upsert: true, new: true }
+    ).lean();
+
+    try {
+      wsService.broadcastFavoriteUpdate(deviceId, favorite === true);
+    } catch (e) {
+      logger.warn("favorites: broadcast favorite:update failed", e);
+    }
+
+    try {
+      if (doc) wsService.broadcastDeviceUpsert(doc);
+    } catch (e) {
+      logger.warn("favorites: broadcast device:upsert failed", e);
+    }
 
     res.json({ success: true });
   } catch (err) {
