@@ -27,6 +27,10 @@ class WsService {
   // dedupe sendSms by clientMsgId (TTL)
   private sendSmsDedupe: Map<string, number> = new Map();
 
+  // delayed offline handling
+  private pendingOfflineTimers: Map<string, NodeJS.Timeout> = new Map();
+  private readonly offlineGraceMs = 10_000;
+
   init(server: http.Server, wsBasePath = config.wsPath) {
     if (this.wss) {
       logger.warn("wsService.init already called");
@@ -111,6 +115,17 @@ class WsService {
     logger.info("wsService: initialized");
   }
 
+  hasActiveDeviceConnection(deviceId: string): boolean {
+    const set = this.clients.get(String(deviceId || "").trim());
+    if (!set || set.size === 0) return false;
+    return true;
+  }
+
+  getActiveDeviceConnectionCount(deviceId: string): number {
+    const set = this.clients.get(String(deviceId || "").trim());
+    return set ? set.size : 0;
+  }
+
   private cleanupSendSmsDedupe() {
     const now = Date.now();
     for (const [k, exp] of this.sendSmsDedupe.entries()) {
@@ -130,6 +145,97 @@ class WsService {
     return false;
   }
 
+  private clearPendingOffline(deviceId: string) {
+    const t = this.pendingOfflineTimers.get(deviceId);
+    if (!t) return;
+
+    clearTimeout(t);
+    this.pendingOfflineTimers.delete(deviceId);
+
+    logger.info("wsService: cleared pending offline timer", { deviceId });
+  }
+
+  private async markDeviceOnline(deviceId: string) {
+    try {
+      await Device.findOneAndUpdate(
+        { deviceId },
+        {
+          $set: {
+            "status.online": true,
+            "status.timestamp": Date.now(),
+          },
+        },
+        { upsert: true },
+      );
+
+      logger.info("Device marked ONLINE (ws connect)", { deviceId });
+    } catch (e) {
+      logger.error("Failed marking online on registerClient", e);
+    }
+  }
+
+  private async markDeviceOfflineNow(deviceId: string, reason: string) {
+    try {
+      if (this.hasActiveDeviceConnection(deviceId)) {
+        logger.info("wsService: skipping offline mark because active ws exists", {
+          deviceId,
+          activeConnections: this.getActiveDeviceConnectionCount(deviceId),
+          reason,
+        });
+        return;
+      }
+
+      await Device.findOneAndUpdate(
+        { deviceId },
+        {
+          $set: {
+            "status.online": false,
+            "status.timestamp": Date.now(),
+          },
+        },
+      );
+
+      logger.info("Device marked OFFLINE (grace elapsed)", {
+        deviceId,
+        reason,
+      });
+
+      this.notifyDeviceStatus(deviceId, {
+        online: false,
+        timestamp: Date.now(),
+      });
+    } catch (e) {
+      logger.error("Failed marking offline", e);
+    }
+  }
+
+  private scheduleOfflineMark(deviceId: string, reason: string) {
+    if (!deviceId || deviceId.startsWith("__ADMIN__") || deviceId === "admin") {
+      return;
+    }
+
+    this.clearPendingOffline(deviceId);
+
+    const timer = setTimeout(() => {
+      this.pendingOfflineTimers.delete(deviceId);
+      this.markDeviceOfflineNow(deviceId, reason).catch((err) => {
+        logger.error("wsService: delayed offline mark failed", {
+          deviceId,
+          reason,
+          error: err,
+        });
+      });
+    }, this.offlineGraceMs);
+
+    this.pendingOfflineTimers.set(deviceId, timer);
+
+    logger.info("wsService: scheduled offline mark", {
+      deviceId,
+      reason,
+      graceMs: this.offlineGraceMs,
+    });
+  }
+
   private async registerClient(deviceId: string, ws: WebSocket) {
     const set = this.clients.get(deviceId) || new Set<WebSocket>();
     set.add(ws);
@@ -138,27 +244,29 @@ class WsService {
     this.socketConnectedAt.set(ws, Date.now());
     this.primaryDeviceSocket.set(deviceId, ws);
 
-    if (!deviceId.startsWith("__ADMIN__") && deviceId !== "admin") {
-      try {
-        await Device.findOneAndUpdate(
-          { deviceId },
-          {
-            $set: {
-              "status.online": true,
-              "status.timestamp": Date.now(),
-            },
-          },
-          { upsert: true },
-        );
+    this.clearPendingOffline(deviceId);
 
-        logger.info("Device marked ONLINE (ws connect)", { deviceId });
-      } catch (e) {
-        logger.error("Failed marking online on registerClient", e);
-      }
+    if (!deviceId.startsWith("__ADMIN__") && deviceId !== "admin") {
+      await this.markDeviceOnline(deviceId);
     }
 
-    ws.once("close", () => this.unregisterClient(deviceId, ws));
-    ws.once("error", () => this.unregisterClient(deviceId, ws));
+    ws.once("close", () => {
+      this.unregisterClient(deviceId, ws).catch((err) => {
+        logger.warn("wsService: unregisterClient(close) failed", {
+          deviceId,
+          error: err,
+        });
+      });
+    });
+
+    ws.once("error", () => {
+      this.unregisterClient(deviceId, ws).catch((err) => {
+        logger.warn("wsService: unregisterClient(error) failed", {
+          deviceId,
+          error: err,
+        });
+      });
+    });
   }
 
   private async registerAdminClient(key: string, ws: WebSocket) {
@@ -175,6 +283,8 @@ class WsService {
   private async unregisterClient(deviceId: string, ws: WebSocket) {
     const set = this.clients.get(deviceId);
     if (!set) return;
+
+    if (!set.has(ws)) return;
 
     set.delete(ws);
 
@@ -206,28 +316,7 @@ class WsService {
     this.clients.delete(deviceId);
 
     if (!deviceId.startsWith("__ADMIN__") && deviceId !== "admin") {
-      try {
-        await Device.findOneAndUpdate(
-          { deviceId },
-          {
-            $set: {
-              "status.online": false,
-              "status.timestamp": Date.now(),
-            },
-          },
-        );
-
-        logger.info("Device marked OFFLINE (instant ws disconnect)", {
-          deviceId,
-        });
-      } catch (e) {
-        logger.error("Failed marking offline", e);
-      }
-
-      this.notifyDeviceStatus(deviceId, {
-        online: false,
-        timestamp: Date.now(),
-      });
+      this.scheduleOfflineMark(deviceId, "ws_disconnect");
     }
 
     logger.info("wsService: device client disconnected", { deviceId });
@@ -236,6 +325,8 @@ class WsService {
   private unregisterAdminClient(key: string, ws: WebSocket) {
     const set = this.adminConnections.get(key);
     if (!set) return;
+
+    if (!set.has(ws)) return;
 
     set.delete(ws);
 
@@ -254,14 +345,21 @@ class WsService {
   private setupListeners(deviceId: string, ws: WebSocket, socketType: string) {
     ws.on("message", async (data: WebSocket.RawData) => {
       const text = data.toString();
-      logger.debug("wsService message", { deviceId, text, socketType });
 
       try {
         const obj: WsPayload = JSON.parse(text);
         const type = obj.type;
 
+        if (type !== "ping") {
+          logger.debug("wsService message", { deviceId, text, socketType });
+        }
+
         if (type === "ping") {
-          ws.send(JSON.stringify({ type: "ack", timestamp: Date.now() }));
+          try {
+            ws.send(JSON.stringify({ type: "ack", timestamp: Date.now() }));
+          } catch {
+            // ignore
+          }
           return;
         }
 
@@ -279,6 +377,10 @@ class WsService {
             },
             { upsert: true },
           );
+
+          if (online) {
+            this.clearPendingOffline(deviceId);
+          }
 
           logger.info("wsService: status updated", {
             deviceId,
@@ -655,6 +757,11 @@ class WsService {
   }
 
   async shutdown() {
+    for (const timer of this.pendingOfflineTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.pendingOfflineTimers.clear();
+
     for (const set of this.clients.values()) {
       for (const ws of set) {
         try {
