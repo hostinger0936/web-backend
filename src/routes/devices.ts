@@ -420,6 +420,36 @@ router.get("/notifications", async (_req, res) => {
   }
 });
 
+router.get("/notifications/summary", async (_req, res) => {
+  try {
+    const [totalSms, distinctDeviceIds, latestSms] = await Promise.all([
+      Sms.countDocuments({}),
+      Sms.distinct("deviceId"),
+      Sms.findOne({})
+        .sort({ timestamp: -1 })
+        .select("timestamp")
+        .lean(),
+    ]);
+
+    const cleanIds = (distinctDeviceIds || [])
+      .map((x: any) => clean(x))
+      .filter(Boolean);
+
+    return res.json({
+      totalDevices: cleanIds.length,
+      totalSms: Number(totalSms || 0),
+      latestTimestamp: Number((latestSms as any)?.timestamp || 0),
+    });
+  } catch (e: any) {
+    logger.error("notifications summary failed", e);
+    return res.status(500).json({
+      totalDevices: 0,
+      totalSms: 0,
+      latestTimestamp: 0,
+    });
+  }
+});
+
 router.get("/notifications/devices", async (_req, res) => {
   try {
     const ids = await Sms.distinct("deviceId");
