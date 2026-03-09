@@ -7,8 +7,9 @@
  *
  * Logic:
  * - Device sends WS status heartbeat (online=true)
- * - If heartbeat not received within threshold → OFFLINE
- * - If there's an active WS connection for the device, skip (WS-driven disconnect is authoritative)
+ * - If heartbeat not received within threshold -> OFFLINE
+ * - If there's an active WS connection for the device, skip
+ * - WS disconnect grace is handled by wsService; this worker is backup safety
  */
 
 import logger from "../logger/logger";
@@ -27,17 +28,15 @@ export function start() {
   }
 
   timer = setInterval(() => {
-    run().catch((err) =>
-      logger.error("heartbeatWorker error", err)
-    );
+    run().catch((err) => logger.error("heartbeatWorker error", err));
   }, INTERVAL_MS);
 
-  // run immediately once
-  run().catch((err) =>
-    logger.error("heartbeatWorker initial run failed", err)
-  );
+  run().catch((err) => logger.error("heartbeatWorker initial run failed", err));
 
-  logger.info("heartbeatWorker: started");
+  logger.info("heartbeatWorker: started", {
+    intervalMs: INTERVAL_MS,
+    offlineThresholdMs: OFFLINE_THRESHOLD_MS,
+  });
 }
 
 export function stop() {
@@ -50,13 +49,15 @@ async function run() {
   logger.debug("heartbeatWorker: checking stale devices");
 
   try {
-    const cutoff = Date.now() - OFFLINE_THRESHOLD_MS;
+    const now = Date.now();
+    const cutoff = now - OFFLINE_THRESHOLD_MS;
 
-    // find devices marked online but heartbeat old
     const staleDevices = await Device.find({
       "status.online": true,
       "status.timestamp": { $lte: cutoff },
-    }).exec();
+    })
+      .select("deviceId status")
+      .exec();
 
     if (!staleDevices.length) {
       logger.debug("heartbeatWorker: no stale devices");
@@ -65,31 +66,29 @@ async function run() {
 
     for (const device of staleDevices) {
       try {
-        const deviceId = (device as any).deviceId;
+        const deviceId = String((device as any).deviceId || "").trim();
+        if (!deviceId) continue;
 
-        // 🔥 WS active hai to skip — live socket presence wins
-        const hasWs = (wsService as any)["clients"]?.has(deviceId);
+        const hasWs = wsService.hasActiveDeviceConnection(deviceId);
         if (hasWs) {
-          logger.info("heartbeatWorker: skipping offline mark — active ws exists", {
+          logger.info("heartbeatWorker: skipping offline mark - active ws exists", {
             deviceId,
+            activeConnections: wsService.getActiveDeviceConnectionCount(deviceId),
           });
           continue;
         }
 
         device.status.online = false;
-        device.status.timestamp = Date.now();
-
+        device.status.timestamp = now;
         await device.save();
 
-        // 🔥 FIX 3 — notify wsService after marking offline (backup)
         try {
           wsService.notifyDeviceStatus(deviceId, {
             online: false,
-            timestamp: Date.now(),
+            timestamp: now,
           });
         } catch (notifyErr) {
-          // don't throw — just log
-          logger.warn("heartbeatWorker: wsService.notifyDeviceStatus failed", {
+          logger.warn("heartbeatWorker: notifyDeviceStatus failed", {
             deviceId,
             err: notifyErr,
           });
@@ -97,13 +96,13 @@ async function run() {
 
         logger.info("heartbeatWorker: marked OFFLINE (backup)", {
           deviceId,
+          lastSeen: (device as any)?.status?.timestamp || null,
+          cutoff,
         });
-
       } catch (err) {
-        logger.warn("heartbeatWorker: failed to update device", err);
+        logger.warn("heartbeatWorker: failed to update stale device", err);
       }
     }
-
   } catch (err) {
     logger.error("heartbeatWorker: run error", err);
   }
