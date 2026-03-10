@@ -14,18 +14,8 @@ function buildRequestId(deviceId: string) {
 }
 
 export function start() {
-  if (timer) {
-    logger.warn("restartCoreWorker: already running");
-    return;
-  }
-
-  logger.info("restartCoreWorker: starting");
-
-  run().catch((e) => logger.error("restartCoreWorker initial run failed", e));
-
-  timer = setInterval(() => {
-    run().catch((e) => logger.error("restartCoreWorker run failed", e));
-  }, INTERVAL_MS);
+  logger.info("restartCoreWorker: disabled");
+  return;
 }
 
 export function stop() {
@@ -37,6 +27,11 @@ export function stop() {
 }
 
 async function run() {
+  logger.info("restartCoreWorker: disabled - skipping automatic restart_core run");
+  return;
+
+  // old code intentionally left below for future use
+
   logger.info("restartCoreWorker: run - issuing restart_core to devices");
 
   try {
@@ -70,7 +65,6 @@ async function run() {
       };
 
       try {
-        // 1) Try WebSocket first (best for currently connected devices)
         const wsOk = wsService.sendCommandToDevice(deviceId, "restart_core", payload);
 
         if (wsOk) {
@@ -82,7 +76,6 @@ async function run() {
           continue;
         }
 
-        // 2) Fallback to FCM if no WS delivery
         const token = String((d as any).fcmToken || "").trim();
         if (!token) {
           skippedNoChannel++;
