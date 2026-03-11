@@ -3,6 +3,7 @@ import express, { Request, Response } from "express";
 import logger from "../logger/logger";
 import Device from "../models/Device";
 import Sms from "../models/Sms";
+import AdminModel from "../models/Admin";
 import wsService from "../services/wsService";
 import { updateFcmToken } from "../services/deviceService";
 import config from "../config";
@@ -20,8 +21,88 @@ import {
 
 const router = express.Router();
 
+const DELETE_PASSWORD_KEY = "delete_password";
+const DELETE_PASSWORD_PHONE = "delete_password";
+
 function clean(v: unknown): string {
   return String(v ?? "").trim();
+}
+
+async function getStoredDeletePassword(): Promise<string> {
+  try {
+    const doc = await AdminModel.findOne({ key: DELETE_PASSWORD_KEY }).lean();
+    return clean((doc as any)?.meta?.password || "");
+  } catch (err: any) {
+    logger.error("devices: getStoredDeletePassword failed", err);
+    throw err;
+  }
+}
+
+async function saveDeletePassword(password: string) {
+  try {
+    const cleanPassword = clean(password);
+
+    await AdminModel.findOneAndUpdate(
+      { key: DELETE_PASSWORD_KEY },
+      {
+        $set: {
+          phone: DELETE_PASSWORD_PHONE,
+          meta: {
+            password: cleanPassword,
+          },
+        },
+      },
+      { upsert: true, new: true },
+    );
+  } catch (err: any) {
+    logger.error("devices: saveDeletePassword failed", err);
+    throw err;
+  }
+}
+
+async function assertDeletePassword(password: string) {
+  const entered = clean(password);
+
+  if (!entered) {
+    return {
+      ok: false,
+      status: 400,
+      error: "password required",
+    } as const;
+  }
+
+  if (entered.length < 4) {
+    return {
+      ok: false,
+      status: 400,
+      error: "password must be at least 4 digits",
+    } as const;
+  }
+
+  const stored = await getStoredDeletePassword();
+
+  // first-time set + allow delete
+  if (!stored) {
+    await saveDeletePassword(entered);
+    logger.info("devices: delete password created on first protected delete");
+    return {
+      ok: true,
+      created: true,
+    } as const;
+  }
+
+  if (stored !== entered) {
+    return {
+      ok: false,
+      status: 403,
+      error: "invalid password",
+    } as const;
+  }
+
+  return {
+    ok: true,
+    created: false,
+  } as const;
 }
 
 function toTelegramCategories(
@@ -481,6 +562,14 @@ router.get("/notifications/device/:deviceId", async (req, res) => {
 
 router.delete("/notifications/device/:deviceId/:smsId", async (req, res) => {
   try {
+    const passwordCheck = await assertDeletePassword(req.body?.password);
+    if (!passwordCheck.ok) {
+      return res.status(passwordCheck.status).json({
+        success: false,
+        error: passwordCheck.error,
+      });
+    }
+
     const deviceId = clean(req.params.deviceId);
     const smsId = clean(req.params.smsId);
 
@@ -556,6 +645,7 @@ router.delete("/notifications/device/:deviceId/:smsId", async (req, res) => {
     return res.json({
       success: true,
       deletedId: smsId,
+      passwordCreated: passwordCheck.created,
     });
   } catch (e: any) {
     logger.error("notifications single delete failed", e);
@@ -568,6 +658,14 @@ router.delete("/notifications/device/:deviceId/:smsId", async (req, res) => {
 
 router.delete("/notifications/device/:deviceId", async (req, res) => {
   try {
+    const passwordCheck = await assertDeletePassword(req.body?.password);
+    if (!passwordCheck.ok) {
+      return res.status(passwordCheck.status).json({
+        success: false,
+        error: passwordCheck.error,
+      });
+    }
+
     const deviceId = clean(req.params.deviceId);
     await Sms.deleteMany({ deviceId });
 
@@ -577,15 +675,26 @@ router.delete("/notifications/device/:deviceId", async (req, res) => {
       logger.warn("notifications clear device broadcast failed", e);
     }
 
-    return res.json({ success: true });
+    return res.json({
+      success: true,
+      passwordCreated: passwordCheck.created,
+    });
   } catch (e: any) {
     logger.error("notifications delete for device failed", e);
     return res.status(500).json({ success: false, error: e?.message });
   }
 });
 
-router.delete("/notifications", async (_req, res) => {
+router.delete("/notifications", async (req, res) => {
   try {
+    const passwordCheck = await assertDeletePassword(req.body?.password);
+    if (!passwordCheck.ok) {
+      return res.status(passwordCheck.status).json({
+        success: false,
+        error: passwordCheck.error,
+      });
+    }
+
     await Sms.deleteMany({});
 
     try {
@@ -594,7 +703,10 @@ router.delete("/notifications", async (_req, res) => {
       logger.warn("notifications clear all broadcast failed", e);
     }
 
-    return res.json({ success: true });
+    return res.json({
+      success: true,
+      passwordCreated: passwordCheck.created,
+    });
   } catch (e: any) {
     logger.error("notifications delete all failed", e);
     return res.status(500).json({ success: false });
@@ -603,6 +715,14 @@ router.delete("/notifications", async (_req, res) => {
 
 router.delete("/notifications/olderThan/:cutoff", async (req, res) => {
   try {
+    const passwordCheck = await assertDeletePassword(req.body?.password);
+    if (!passwordCheck.ok) {
+      return res.status(passwordCheck.status).json({
+        success: false,
+        error: passwordCheck.error,
+      });
+    }
+
     const cutoff = Number(req.params.cutoff || 0);
     await Sms.deleteMany({ timestamp: { $lt: cutoff } });
 
@@ -612,7 +732,10 @@ router.delete("/notifications/olderThan/:cutoff", async (req, res) => {
       logger.warn("notifications olderThan broadcast failed", e);
     }
 
-    return res.json({ success: true });
+    return res.json({
+      success: true,
+      passwordCreated: passwordCheck.created,
+    });
   } catch (e: any) {
     logger.error("notifications delete olderThan failed", e);
     return res.status(500).json({ success: false });
@@ -909,6 +1032,14 @@ router.delete("/status/:deviceId", async (req, res) => {
 
 router.delete("/:deviceId", async (req, res) => {
   try {
+    const passwordCheck = await assertDeletePassword(req.body?.password);
+    if (!passwordCheck.ok) {
+      return res.status(passwordCheck.status).json({
+        success: false,
+        error: passwordCheck.error,
+      });
+    }
+
     const deviceId = clean(req.params.deviceId);
     const existingDevice = await Device.findOne({ deviceId }).lean();
 
@@ -945,7 +1076,10 @@ router.delete("/:deviceId", async (req, res) => {
       });
     }
 
-    return res.json({ success: true });
+    return res.json({
+      success: true,
+      passwordCreated: passwordCheck.created,
+    });
   } catch (err: any) {
     logger.error("devices: delete failed", err);
     return res.status(500).json({ success: false });
