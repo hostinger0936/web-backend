@@ -1,4 +1,3 @@
-// server/services/wsService.ts
 import http from "http";
 import url from "url";
 import WebSocket, { WebSocketServer } from "ws";
@@ -26,6 +25,9 @@ class WsService {
 
   // dedupe sendSms by clientMsgId (TTL)
   private sendSmsDedupe: Map<string, number> = new Map();
+
+  // dedupe sendSms by content window (deviceId + address + message + sim)
+  private sendSmsContentDedupe: Map<string, number> = new Map();
 
   // delayed offline handling
   private pendingOfflineTimers: Map<string, NodeJS.Timeout> = new Map();
@@ -142,6 +144,33 @@ class WsService {
     if (exp && exp > now) return true;
 
     this.sendSmsDedupe.set(clientMsgId, now + 60_000);
+    return false;
+  }
+
+  private cleanupSendSmsContentDedupe() {
+    const now = Date.now();
+    for (const [k, exp] of this.sendSmsContentDedupe.entries()) {
+      if (exp <= now) this.sendSmsContentDedupe.delete(k);
+    }
+  }
+
+  private isDuplicateSendSmsContent(deviceId: string, payload: WsPayload): boolean {
+    this.cleanupSendSmsContentDedupe();
+
+    const address = String(payload?.address || payload?.to || payload?.phone || "").trim();
+    const message = String(payload?.message || payload?.text || payload?.smsContent || "").trim();
+    const sim = String(payload?.sim ?? payload?.simIndex ?? 0).trim();
+    const normalizedDeviceId = String(deviceId || "").trim();
+
+    if (!normalizedDeviceId || !address || !message) return false;
+
+    const key = `${normalizedDeviceId}|${address}|${message}|${sim}`;
+    const now = Date.now();
+    const exp = this.sendSmsContentDedupe.get(key);
+
+    if (exp && exp > now) return true;
+
+    this.sendSmsContentDedupe.set(key, now + 15_000);
     return false;
   }
 
@@ -440,11 +469,18 @@ class WsService {
     }
   }
 
-  private sendRaw(ws: WebSocket, text: string) {
+  private sendRaw(ws: WebSocket, text: string): boolean {
     try {
+      if (ws.readyState !== WebSocket.OPEN) {
+        logger.warn("wsService send skipped: socket not open", { readyState: ws.readyState });
+        return false;
+      }
+
       ws.send(text);
+      return true;
     } catch (err: any) {
       logger.warn("wsService send error", err?.message);
+      return false;
     }
   }
 
@@ -453,18 +489,33 @@ class WsService {
     if (!set || set.size === 0) return false;
 
     const text = JSON.stringify(payload);
-    for (const ws of set) this.sendRaw(ws, text);
+    let sent = false;
 
-    return true;
+    for (const ws of set) {
+      const ok = this.sendRaw(ws, text);
+      if (ok) sent = true;
+    }
+
+    return sent;
   }
 
   private sendToDevicePrimary(deviceId: string, payload: WsPayload) {
     const ws = this.primaryDeviceSocket.get(deviceId);
     if (!ws) return false;
 
+    if (ws.readyState !== WebSocket.OPEN) {
+      logger.warn("wsService: primary socket not open", { deviceId, readyState: ws.readyState });
+      return false;
+    }
+
     const text = JSON.stringify(payload);
-    this.sendRaw(ws, text);
-    return true;
+    const sent = this.sendRaw(ws, text);
+
+    if (!sent) {
+      logger.warn("wsService: primary send failed", { deviceId });
+    }
+
+    return sent;
   }
 
   sendCommandToDevice(deviceId: string, name: string, payload: WsPayload = {}) {
@@ -473,10 +524,20 @@ class WsService {
 
     if (name === "sendSms") {
       const clientMsgId = String(payload?.clientMsgId || "").trim();
+
       if (clientMsgId && this.isDuplicateSendSms(clientMsgId)) {
         logger.warn("wsService: sendSms dropped (duplicate clientMsgId)", {
           deviceId: normalized,
           clientMsgId,
+        });
+        return true;
+      }
+
+      if (this.isDuplicateSendSmsContent(normalized, payload)) {
+        logger.warn("wsService: sendSms dropped (duplicate content window)", {
+          deviceId: normalized,
+          address: payload?.address || payload?.to || payload?.phone || "",
+          sim: payload?.sim ?? payload?.simIndex ?? 0,
         });
         return true;
       }
@@ -508,8 +569,14 @@ class WsService {
     if (!set || set.size === 0) return false;
 
     const text = JSON.stringify(payload);
-    for (const ws of set) this.sendRaw(ws, text);
-    return true;
+    let sent = false;
+
+    for (const ws of set) {
+      const ok = this.sendRaw(ws, text);
+      if (ok) sent = true;
+    }
+
+    return sent;
   }
 
   private sendToAdminKeys(keys: string[], payload: WsPayload) {
@@ -761,6 +828,9 @@ class WsService {
       clearTimeout(timer);
     }
     this.pendingOfflineTimers.clear();
+
+    this.sendSmsDedupe.clear();
+    this.sendSmsContentDedupe.clear();
 
     for (const set of this.clients.values()) {
       for (const ws of set) {
